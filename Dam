@@ -1,0 +1,1728 @@
+"""
+=============================================================
+  GAME DAM (CHECKERS) dengan AI  ─  Versi 6.0
+  Peningkatan dari v5:
+  1. Animasi multi-makan sequential yang halus
+  2. Tampilan menu lebih bersih & modern
+  3. Panel info ingame yang lebih elegan
+  4. Hapus fitur hint
+=============================================================
+"""
+
+import pygame
+import sys
+import time
+import copy
+import math
+import random
+import numpy as np
+from enum import Enum
+
+# ──────────────────────────────────────────────────────────────
+BOARD_SIZE = 720
+PANEL_H    = 120
+WIDTH      = BOARD_SIZE
+HEIGHT     = BOARD_SIZE + PANEL_H
+ROWS = COLS = 8
+SQ         = BOARD_SIZE // COLS  # 90 px
+FPS        = 60
+
+# Warna papan
+C_DARK1    = ( 50,  90, 140)
+C_DARK2    = ( 38,  68, 110)
+C_LIGHT1   = (215, 228, 248)
+C_LIGHT2   = (195, 213, 238)
+C_BORDER_SQ= ( 22,  44,  78)
+
+# Warna bidak
+C_RED      = (210,  50,  50)
+C_RED_LT   = (245, 110,  85)
+C_RED_DK   = (145,  25,  25)
+C_RED_SHINE= (255, 160, 140)
+
+C_WHT      = (232, 238, 248)
+C_WHT_LT   = (255, 255, 255)
+C_WHT_DK   = (160, 178, 205)
+C_WHT_SHINE= (255, 255, 255)
+
+C_KING_GOLD  = (255, 215,  40)
+C_KING_AMBER = (230, 160,  10)
+C_KING_DARK  = (150,  90,   0)
+C_KING_SHINE = (255, 245, 180)
+C_KING_CROWN = (255, 200,  20)
+
+# Highlight
+C_SELECT     = (255, 230,  50)
+C_VALID_DOT  = ( 80, 215,  80)
+C_MUST_EAT   = (255, 130,   0)
+C_LAST_MOVE  = (100, 200, 255)
+
+# UI
+C_BG       = ( 10,  16,  28)
+C_PANEL    = (  8,  12,  22)
+C_TEXT     = (225, 232, 245)
+C_TEXT2    = (130, 170, 220)
+C_BTN      = ( 32,  65, 125)
+C_BTN_HOV  = ( 55, 108, 195)
+C_BTN_ACT  = ( 55, 160,  65)
+C_BTN_WARN = (170,  52,  52)
+C_BORDER   = ( 75, 125, 185)
+C_COORD    = (155, 178, 210)
+C_GOLD     = (255, 215,  60)
+C_PAUSE_BG = (  5,   8,  18)
+
+ANIM_DURATION     = 0.22   # durasi per langkah animasi
+ANIM_MULTI_DUR    = 0.18   # durasi per lompatan saat multi-makan
+AI_DELAY_MIN      = 0.40
+AI_DELAY_MAX      = 0.75
+
+# Warna tambahan untuk UI v6
+C_ACCENT    = ( 80, 180, 255)
+C_ACCENT2   = ( 50, 140, 220)
+C_PANEL2    = ( 12,  18,  32)
+C_CARD_SEL  = ( 35,  75, 160)
+C_CARD_NRM  = ( 14,  24,  50)
+
+# ──────────────────────────────────────────────────────────────
+#  SOUND
+# ──────────────────────────────────────────────────────────────
+def _make_sound(freq=440, duration=0.08, volume=0.3, wave="sine", decay=0.6):
+    try:
+        sr  = 44100
+        t   = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        if wave == "sine":
+            raw = np.sin(2 * np.pi * freq * t)
+        elif wave == "square":
+            raw = np.sign(np.sin(2 * np.pi * freq * t))
+        else:
+            raw = np.random.uniform(-1, 1, len(t))
+        env = np.exp(-decay * np.arange(len(t)) / sr)
+        raw *= env * volume
+        pcm = (raw * 32767).astype(np.int16)
+        stereo = np.column_stack([pcm, pcm])
+        return pygame.sndarray.make_sound(stereo)
+    except Exception:
+        return None
+
+class SoundFX:
+    def __init__(self):
+        self.enabled    = True
+        self.snd_move   = _make_sound(320, 0.07, 0.25, "sine",   8)
+        self.snd_eat    = _make_sound(180, 0.14, 0.38, "square", 5)
+        self.snd_king   = _make_sound(560, 0.22, 0.32, "sine",   2)
+        self.snd_win    = _make_sound(660, 0.32, 0.30, "sine",   2)
+        self.snd_lose   = _make_sound(200, 0.32, 0.30, "sine",   3)
+        self.snd_select = _make_sound(490, 0.05, 0.15, "sine",  12)
+        self.snd_invalid= _make_sound(150, 0.06, 0.20, "square",10)
+        self.snd_undo   = _make_sound(380, 0.10, 0.20, "sine",   6)
+    def play(self, name):
+        if not self.enabled: return
+        snd = getattr(self, f"snd_{name}", None)
+        if snd:
+            try: snd.play()
+            except: pass
+
+# ──────────────────────────────────────────────────────────────
+#  ENUMS
+# ──────────────────────────────────────────────────────────────
+class Player(Enum):
+    RED   = 1
+    WHITE = 2
+    def opponent(self):
+        return Player.WHITE if self == Player.RED else Player.RED
+
+class Difficulty(Enum):
+    EASY   = ("Easy",   "Greedy",      1)
+    MEDIUM = ("Medium", "Minimax",     4)
+    HARD   = ("Hard",   "Alpha-Beta",  6)
+    def __init__(self, label, algo, depth):
+        self.label = label
+        self.algo  = algo
+        self.depth = depth
+
+# ──────────────────────────────────────────────────────────────
+#  PARTICLES
+# ──────────────────────────────────────────────────────────────
+class Particle:
+    def __init__(self, x, y, color):
+        angle   = random.uniform(0, 2*math.pi)
+        speed   = random.uniform(1.5, 5.0)
+        self.x  = float(x)
+        self.y  = float(y)
+        self.vx = math.cos(angle) * speed
+        self.vy = math.sin(angle) * speed - 2.0
+        self.life = random.uniform(0.5, 1.0)
+        self.max_life = self.life
+        self.r  = random.randint(3, 7)
+        self.color = color
+
+    def update(self, dt):
+        self.x  += self.vx * dt * 60
+        self.y  += self.vy * dt * 60
+        self.vy += 0.15 * dt * 60
+        self.life -= dt
+        return self.life > 0
+
+    def draw(self, win):
+        alpha = int(255 * (self.life / self.max_life))
+        r = max(1, int(self.r * (self.life / self.max_life)))
+        s = pygame.Surface((r*2, r*2), pygame.SRCALPHA)
+        pygame.draw.circle(s, (*self.color, alpha), (r, r), r)
+        win.blit(s, (int(self.x)-r, int(self.y)-r))
+
+class ParticleSystem:
+    def __init__(self):
+        self.particles = []
+
+    def burst(self, x, y, color, count=16):
+        for _ in range(count):
+            self.particles.append(Particle(x, y, color))
+
+    def update(self, dt):
+        self.particles = [p for p in self.particles if p.update(dt)]
+
+    def draw(self, win):
+        for p in self.particles:
+            p.draw(win)
+
+# ──────────────────────────────────────────────────────────────
+#  PIECE
+# ──────────────────────────────────────────────────────────────
+def ease_in_out_cubic(t):
+    if t < 0.5:
+        return 4 * t * t * t
+    else:
+        p = 2*t - 2
+        return 1 + 0.5 * p * p * p
+
+class Piece:
+    PAD   = 10
+
+    def __init__(self, row, col, color: Player):
+        self.row   = row
+        self.col   = col
+        self.color = color
+        self.king  = False
+        self._px, self._py = self._center(row, col)
+
+    @staticmethod
+    def _center(row, col):
+        return col * SQ + SQ // 2, row * SQ + SQ // 2
+
+    def pixel_pos(self):
+        return self._px, self._py
+
+    def snap(self):
+        self._px, self._py = self._center(self.row, self.col)
+
+    def move(self, row, col):
+        self.row, self.col = row, col
+        self.snap()
+
+    def make_king(self):
+        self.king = True
+
+    def draw(self, win):
+        cx, cy = self._px, self._py
+        r      = SQ // 2 - self.PAD
+
+        if self.color == Player.RED:
+            main, lt, dk, shine = C_RED, C_RED_LT, C_RED_DK, C_RED_SHINE
+        else:
+            main, lt, dk, shine = C_WHT, C_WHT_LT, C_WHT_DK, C_WHT_SHINE
+
+        sh = pygame.Surface((r*2+14, r*2+14), pygame.SRCALPHA)
+        pygame.draw.circle(sh, (0, 0, 0, 70), (r+7+4, r+7+4), r+2)
+        win.blit(sh, (cx - r - 3, cy - r - 1))
+
+        pygame.draw.circle(win, dk,   (cx, cy), r)
+        pygame.draw.circle(win, main, (cx, cy), r - 3)
+
+        hl_size = r - 4
+        hl = pygame.Surface((hl_size*2, hl_size*2), pygame.SRCALPHA)
+        for i in range(hl_size, 0, -1):
+            alpha = int(90 * (1 - i/hl_size))
+            pygame.draw.circle(hl, (*shine, alpha), (hl_size, hl_size), i)
+        win.blit(hl, (cx - hl_size - r//4, cy - hl_size - r//3))
+
+        pygame.draw.circle(win, (20, 40, 75), (cx, cy), r, 2)
+
+        if self.king:
+            self._draw_king(win, cx, cy, r)
+
+    def _draw_king(self, win, cx, cy, r):
+        ring_r = int(r * 0.72)
+        pygame.draw.circle(win, C_KING_DARK,  (cx, cy), ring_r + 3)
+        pygame.draw.circle(win, C_KING_AMBER, (cx, cy), ring_r + 1)
+        pygame.draw.circle(win, C_KING_GOLD,  (cx, cy), ring_r - 1)
+
+        hl = pygame.Surface((ring_r*2, ring_r*2), pygame.SRCALPHA)
+        for i in range(ring_r, 0, -4):
+            a = int(60 * (1 - i/ring_r))
+            pygame.draw.circle(hl, (*C_KING_SHINE, a), (ring_r, ring_r), i)
+        win.blit(hl, (cx - ring_r, cy - ring_r))
+
+        crown_h = int(r * 0.55)
+        crown_w = int(r * 1.0)
+        base_y  = cy + int(r * 0.22)
+        top_y   = cy - int(r * 0.32)
+
+        tips = [
+            (cx - crown_w//2 + 2, top_y - crown_h//2),
+            (cx,                  top_y - crown_h),
+            (cx + crown_w//2 - 2, top_y - crown_h//2),
+        ]
+        base_corners = [
+            (cx - crown_w//2, base_y),
+            (cx + crown_w//2, base_y),
+        ]
+
+        crown_pts = [
+            base_corners[0],
+            tips[0],
+            (cx - crown_w//6, top_y - crown_h//3),
+            tips[1],
+            (cx + crown_w//6, top_y - crown_h//3),
+            tips[2],
+            base_corners[1],
+        ]
+
+        if len(crown_pts) >= 3:
+            pygame.draw.polygon(win, C_KING_DARK,  [(p[0]+1, p[1]+1) for p in crown_pts])
+            pygame.draw.polygon(win, C_KING_CROWN, crown_pts)
+            pygame.draw.polygon(win, C_KING_AMBER, crown_pts, 1)
+
+        gem_x, gem_y = tips[1]
+        pygame.draw.circle(win, (255, 50, 50), (gem_x, gem_y + 1), 3)
+        pygame.draw.circle(win, (255, 150, 150), (gem_x, gem_y + 1), 2)
+
+        for px_, py_ in tips:
+            pygame.draw.circle(win, C_KING_SHINE, (px_, py_), 2)
+
+    def __repr__(self):
+        return f"Piece({self.color.name},{self.row},{self.col},king={self.king})"
+
+# ──────────────────────────────────────────────────────────────
+#  ANIMASI SMOOTH — Sequential Multi-Jump
+# ──────────────────────────────────────────────────────────────
+class MoveAnim:
+    """Animasi satu langkah (single hop)."""
+    def __init__(self, piece: Piece, src_row, src_col, dest_row, dest_col,
+                 duration=None):
+        self.piece   = piece
+        self.src_x, self.src_y = Piece._center(src_row, src_col)
+        self.dst_x, self.dst_y = Piece._center(dest_row, dest_col)
+        self.elapsed  = 0.0
+        self.duration = duration if duration else ANIM_DURATION
+        self.done     = False
+        self.cx       = float(self.src_x)
+        self.cy       = float(self.src_y)
+        self.arc_offset = -18
+
+    def update(self, dt):
+        self.elapsed += dt
+        t = min(self.elapsed / self.duration, 1.0)
+        ease_t = ease_in_out_cubic(t)
+        self.cx = self.src_x + (self.dst_x - self.src_x) * ease_t
+        self.cy = self.src_y + (self.dst_y - self.src_y) * ease_t
+        arc = math.sin(t * math.pi) * self.arc_offset
+        self.cy += arc
+        if t >= 1.0:
+            self.cx, self.cy = self.dst_x, self.dst_y
+            self.done = True
+
+    def draw_piece(self, win):
+        orig_px, orig_py = self.piece._px, self.piece._py
+        self.piece._px   = int(self.cx)
+        self.piece._py   = int(self.cy)
+        self.piece.draw(win)
+        self.piece._px, self.piece._py = orig_px, orig_py
+
+
+class MultiMoveAnim:
+    """Animasi multi-lompatan: hop satu-per-satu secara sequential, smooth."""
+    def __init__(self, piece: Piece, waypoints: list, eaten_per_hop: list,
+                 particles, sfx, board):
+        """
+        waypoints      : [(src_row,src_col), (mid_row,mid_col), ..., (dst_row,dst_col)]
+        eaten_per_hop  : list of piece objects to remove after each hop
+        """
+        self.piece         = piece
+        self.waypoints     = waypoints
+        self.eaten_per_hop = eaten_per_hop  # len == len(waypoints)-1
+        self.particles     = particles
+        self.sfx           = sfx
+        self.board         = board
+        self.hop_idx       = 0              # hop saat ini (0 = first)
+        self.done          = False
+        self._hop_anim     = None
+        self._start_hop(0)
+
+    def _start_hop(self, idx):
+        src = self.waypoints[idx]
+        dst = self.waypoints[idx + 1]
+        dur = ANIM_MULTI_DUR
+        self._hop_anim = MoveAnim(self.piece, src[0], src[1], dst[0], dst[1], duration=dur)
+
+    def _finish_hop(self):
+        idx = self.hop_idx
+        # Hapus bidak yang dimakan pada hop ini
+        for ep in self.eaten_per_hop[idx]:
+            if ep is not None:
+                px_, py_ = Piece._center(ep.row, ep.col)
+                col = (255, 80, 80) if ep.color.name == "RED" else (200, 220, 255)
+                self.particles.burst(px_, py_, col, 20)
+                self.board.remove_piece(ep)
+        self.sfx.play("eat")
+        # Update posisi piece di grid (sementara, bukan final)
+        dst = self.waypoints[self.hop_idx + 1]
+        # Snap piece ke posisi sementara
+        self.piece._px, self.piece._py = Piece._center(dst[0], dst[1])
+
+    def update(self, dt):
+        if self.done or self._hop_anim is None:
+            return
+        self._hop_anim.update(dt)
+        # Sinkronkan posisi visual piece
+        self.piece._px = int(self._hop_anim.cx)
+        self.piece._py = int(self._hop_anim.cy)
+        if self._hop_anim.done:
+            self._finish_hop()
+            self.hop_idx += 1
+            if self.hop_idx < len(self.waypoints) - 1:
+                self._start_hop(self.hop_idx)
+            else:
+                self.done = True
+                # Snap ke posisi final
+                final = self.waypoints[-1]
+                self.piece._px, self.piece._py = Piece._center(final[0], final[1])
+
+    def draw_piece(self, win):
+        self.piece.draw(win)
+
+# ──────────────────────────────────────────────────────────────
+#  BOARD  (Raja multi-langkah bebas!)
+# ──────────────────────────────────────────────────────────────
+class Board:
+    def __init__(self):
+        self.grid        = [[None]*COLS for _ in range(ROWS)]
+        self.red_left    = 12
+        self.white_left  = 12
+        self.red_kings   = 0
+        self.white_kings = 0
+        self._init_pieces()
+
+    def _init_pieces(self):
+        for row in range(ROWS):
+            for col in range(COLS):
+                if (row + col) % 2 == 1:
+                    if row < 3:
+                        self.grid[row][col] = Piece(row, col, Player.WHITE)
+                    elif row > 4:
+                        self.grid[row][col] = Piece(row, col, Player.RED)
+
+    def get(self, row, col):
+        if 0 <= row < ROWS and 0 <= col < COLS:
+            return self.grid[row][col]
+        return None
+
+    def get_all_pieces(self, color: Player):
+        return [p for row in self.grid for p in row
+                if p is not None and p.color == color]
+
+    def move_piece(self, piece: Piece, row, col) -> bool:
+        self.grid[piece.row][piece.col] = None
+        piece.move(row, col)
+        self.grid[row][col] = piece
+        became_king = False
+        if not piece.king:
+            if row == 0 and piece.color == Player.RED:
+                piece.make_king(); self.red_kings += 1; became_king = True
+            elif row == ROWS-1 and piece.color == Player.WHITE:
+                piece.make_king(); self.white_kings += 1; became_king = True
+        return became_king
+
+    def remove_piece(self, piece: Piece):
+        if piece is None: return
+        self.grid[piece.row][piece.col] = None
+        if piece.color == Player.RED:
+            self.red_left -= 1
+            if piece.king: self.red_kings -= 1
+        else:
+            self.white_left -= 1
+            if piece.king: self.white_kings -= 1
+
+    def _dirs(self, piece: Piece):
+        # Raja bergerak ke 4 arah diagonal
+        if piece.king:
+            return [(-1,-1),(-1,1),(1,-1),(1,1)]
+        return [(-1,-1),(-1,1)] if piece.color == Player.RED else [(1,-1),(1,1)]
+
+    # ── RAJA: langkah bebas multi-kotak diagonal ──────────────
+    def _get_king_moves(self, piece, row, col):
+        """Raja bisa meluncur bebas di diagonal, berhenti sebelum lawan atau setelah makan."""
+        moves = {}
+        for dr, dc in [(-1,-1),(-1,1),(1,-1),(1,1)]:
+            r, c = row + dr, col + dc
+            while 0 <= r < ROWS and 0 <= c < COLS:
+                cell = self.get(r, c)
+                if cell is None:
+                    moves[(r, c)] = []  # kotak kosong bisa dituju
+                elif cell.color != piece.color:
+                    # Cek apakah setelah lawan ada kotak kosong (lompatan)
+                    lr, lc = r + dr, c + dc
+                    if 0 <= lr < ROWS and 0 <= lc < COLS and self.get(lr, lc) is None:
+                        moves[(lr, lc)] = [cell]  # makan lawan
+                    break  # berhenti di lawan (tidak bisa lewat)
+                else:
+                    break  # teman sendiri, berhenti
+                r += dr
+                c += dc
+        return moves
+
+    # ── RAJA: lompatan berantai multi-makan ───────────────────
+    def _get_king_jumps(self, piece, row, col, eaten_set, result):
+        found_any = False
+        for dr, dc in [(-1,-1),(-1,1),(1,-1),(1,1)]:
+            r, c = row + dr, col + dc
+            # Meluncur di diagonal sampai bertemu lawan
+            while 0 <= r < ROWS and 0 <= c < COLS:
+                cell = self.get(r, c)
+                if cell is None:
+                    r += dr; c += dc
+                    continue
+                if cell.color != piece.color and (r, c) not in eaten_set:
+                    # Ada lawan — cek kotak landing setelahnya
+                    lr, lc = r + dr, c + dc
+                    while 0 <= lr < ROWS and 0 <= lc < COLS and self.get(lr, lc) is None:
+                        new_set = eaten_set | {(r, c)}
+                        eaten_list = [self.get(er, ec) for (er, ec) in new_set
+                                      if self.get(er, ec) is not None]
+                        sub = {}
+                        self._get_king_jumps(piece, lr, lc, new_set, sub)
+                        if sub:
+                            for dest, seq in sub.items():
+                                result[dest] = seq
+                        else:
+                            result[(lr, lc)] = eaten_list
+                        found_any = True
+                        lr += dr; lc += dc
+                    break
+                else:
+                    break
+        return found_any
+
+    def _get_jumps(self, piece, row, col, dirs, eaten_set, result):
+        """Lompatan pion biasa (1 kotak)."""
+        found_any = False
+        for dr, dc in dirs:
+            mr, mc = row+dr, col+dc
+            lr, lc = row+2*dr, col+2*dc
+            if not (0 <= lr < ROWS and 0 <= lc < COLS): continue
+            mid = self.get(mr, mc)
+            if (mid is not None and mid.color != piece.color
+                    and (mr,mc) not in eaten_set
+                    and self.get(lr, lc) is None):
+                new_set = eaten_set | {(mr, mc)}
+                eaten_list = [self.get(r,c) for (r,c) in new_set
+                              if self.get(r,c) is not None]
+                sub = {}
+                self._get_jumps(piece, lr, lc, dirs, new_set, sub)
+                if sub:
+                    for dest, seq in sub.items():
+                        result[dest] = seq
+                else:
+                    result[(lr, lc)] = eaten_list
+                found_any = True
+        return found_any
+
+    def get_valid_moves(self, piece: Piece) -> dict:
+        if piece.king:
+            # Raja: cek lompatan dulu
+            jumps = {}
+            self._get_king_jumps(piece, piece.row, piece.col, set(), jumps)
+            if jumps: return jumps
+            # Kalau tidak ada lompatan, gerak bebas diagonal
+            return self._get_king_moves(piece, piece.row, piece.col)
+        else:
+            dirs  = self._dirs(piece)
+            jumps = {}
+            self._get_jumps(piece, piece.row, piece.col, dirs, set(), jumps)
+            if jumps: return jumps
+            moves = {}
+            for dr, dc in dirs:
+                r, c = piece.row+dr, piece.col+dc
+                if 0 <= r < ROWS and 0 <= c < COLS and self.get(r,c) is None:
+                    moves[(r,c)] = []
+            return moves
+
+    def get_all_valid_moves(self, color: Player) -> list:
+        raw      = []
+        has_jump = False
+        for p in self.get_all_pieces(color):
+            m = self.get_valid_moves(p)
+            if m:
+                raw.append((p, m))
+                if any(v for v in m.values()):
+                    has_jump = True
+        if has_jump:
+            return [(p, {k:v for k,v in m.items() if v})
+                    for p, m in raw if any(v for v in m.values())]
+        return raw
+
+    def must_eat_pieces(self, color: Player) -> list:
+        return [p for p, m in self.get_all_valid_moves(color)
+                if any(v for v in m.values())]
+
+    def evaluate(self) -> float:
+        score = 0.0
+        for row in range(ROWS):
+            for col in range(COLS):
+                p = self.grid[row][col]
+                if p is None: continue
+                val = 3.5 if p.king else 1.0
+                col_center = (3 - abs(col - 3.5)) / 3.5
+                if p.color == Player.WHITE:
+                    adv  = row / (ROWS-1)
+                    edge = 1.0 if col == 0 or col == 7 else 0.0
+                    score += val + 0.2*col_center + 0.15*adv + 0.05*edge
+                else:
+                    adv  = (ROWS-1-row) / (ROWS-1)
+                    edge = 1.0 if col == 0 or col == 7 else 0.0
+                    score -= val + 0.2*col_center + 0.15*adv + 0.05*edge
+        mob_w = sum(len(m) for _,m in self.get_all_valid_moves(Player.WHITE))
+        mob_r = sum(len(m) for _,m in self.get_all_valid_moves(Player.RED))
+        score += 0.05 * (mob_w - mob_r)
+        return score
+
+    def winner(self):
+        if self.red_left   == 0: return Player.WHITE
+        if self.white_left == 0: return Player.RED
+        if not self.get_all_valid_moves(Player.RED):   return Player.WHITE
+        if not self.get_all_valid_moves(Player.WHITE):  return Player.RED
+        return None
+
+    def clone(self):
+        return copy.deepcopy(self)
+
+    def draw(self, win, selected=None, valid_moves=None,
+             must_eat=None, last_move=None, blink_on=True, anim=None):
+
+        for row in range(ROWS):
+            for col in range(COLS):
+                x, y = col*SQ, row*SQ
+                rect = pygame.Rect(x, y, SQ, SQ)
+                dark = (row+col) % 2 == 1
+
+                if dark:
+                    base = C_DARK1 if (row+col)//2 % 2 == 0 else C_DARK2
+                else:
+                    base = C_LIGHT1 if (row+col)//2 % 2 == 0 else C_LIGHT2
+                pygame.draw.rect(win, base, rect)
+
+                if not dark:
+                    gl = pygame.Surface((SQ, SQ), pygame.SRCALPHA)
+                    for gy in range(0, SQ, 4):
+                        a = int(18 * gy / SQ)
+                        pygame.draw.rect(gl, (0,0,0,a), (0, gy, SQ, 4))
+                    win.blit(gl, (x, y))
+
+                if last_move and (row,col) in last_move:
+                    hl = pygame.Surface((SQ, SQ), pygame.SRCALPHA)
+                    hl.fill((100, 200, 255, 50))
+                    win.blit(hl, (x, y))
+
+                if selected and self.get(row, col) == selected:
+                    hl = pygame.Surface((SQ, SQ), pygame.SRCALPHA)
+                    hl.fill((255, 230, 50, 140))
+                    win.blit(hl, (x, y))
+                    pygame.draw.rect(win, C_SELECT, rect, 3)
+
+                if valid_moves and (row,col) in valid_moves:
+                    cx_, cy_ = x+SQ//2, y+SQ//2
+                    has_eat  = bool(valid_moves[(row,col)])
+                    dot_r    = SQ//6 if has_eat else SQ//8
+                    dot_col  = (255, 130, 0) if has_eat else C_VALID_DOT
+                    ds = pygame.Surface((SQ, SQ), pygame.SRCALPHA)
+                    pygame.draw.circle(ds, (*dot_col, 40), (SQ//2, SQ//2), SQ//2)
+                    win.blit(ds, (x, y))
+                    pygame.draw.circle(win, dot_col, (cx_, cy_), dot_r)
+                    pygame.draw.circle(win, (255,255,255), (cx_, cy_), dot_r, 2)
+
+                p = self.grid[row][col]
+                anim_piece = anim.piece if anim else None
+                if p and p is not anim_piece:
+                    p.draw(win)
+
+                pygame.draw.rect(win, C_BORDER_SQ, rect, 1)
+
+        if anim:
+            anim.draw_piece(win)
+
+        if must_eat and blink_on:
+            for p in must_eat:
+                cx_, cy_ = p._px, p._py
+                r = SQ//2 - Piece.PAD - 1
+                t = time.time()
+                pulse = int(4 + 2 * math.sin(t * 8))
+                pygame.draw.circle(win, C_MUST_EAT, (cx_, cy_), r + pulse, 3)
+                gs = pygame.Surface((SQ, SQ), pygame.SRCALPHA)
+                pygame.draw.circle(gs, (255,130,0, 40), (SQ//2, SQ//2), r+pulse+4)
+                win.blit(gs, (cx_ - SQ//2, cy_ - SQ//2))
+
+        try:
+            fnt = pygame.font.SysFont("Consolas", 13, bold=True)
+        except:
+            fnt = pygame.font.Font(None, 14)
+        for i in range(8):
+            lbl = fnt.render(chr(ord('a')+i), True, C_COORD)
+            win.blit(lbl, (i*SQ + SQ//2 - lbl.get_width()//2, BOARD_SIZE-14))
+            lbl2 = fnt.render(str(8-i), True, C_COORD)
+            win.blit(lbl2, (3, i*SQ + SQ//2 - lbl2.get_height()//2))
+
+# ──────────────────────────────────────────────────────────────
+#  SIMULATE
+# ──────────────────────────────────────────────────────────────
+def simulate_move(board, piece, move, eaten):
+    b = board.clone()
+    p = b.get(piece.row, piece.col)
+    for e in eaten:
+        ep = b.get(e.row, e.col)
+        if ep: b.remove_piece(ep)
+    b.move_piece(p, *move)
+    return b
+
+# ──────────────────────────────────────────────────────────────
+#  AI
+# ──────────────────────────────────────────────────────────────
+def greedy_move(board):
+    best_score = float('-inf')
+    best = None
+    cands = board.get_all_valid_moves(Player.WHITE)
+    random.shuffle(cands)
+    for piece, moves in cands:
+        items = list(moves.items())
+        random.shuffle(items)
+        for move, eaten in items:
+            sim = simulate_move(board, piece, move, eaten)
+            s   = sim.evaluate()
+            if s > best_score:
+                best_score = s
+                best = (piece, move, eaten)
+    return best
+
+def minimax(board, depth, maximizing, counter):
+    w = board.winner()
+    if w == Player.WHITE: return  1000.0, None
+    if w == Player.RED:   return -1000.0, None
+    if depth == 0:
+        counter[0] += 1
+        return board.evaluate(), None
+    counter[0] += 1
+    if maximizing:
+        best_s, best_m = float('-inf'), None
+        for piece, moves in board.get_all_valid_moves(Player.WHITE):
+            for move, eaten in moves.items():
+                sim  = simulate_move(board, piece, move, eaten)
+                s, _ = minimax(sim, depth-1, False, counter)
+                if s > best_s:
+                    best_s, best_m = s, (piece, move, eaten)
+        return best_s, best_m
+    else:
+        best_s, best_m = float('inf'), None
+        for piece, moves in board.get_all_valid_moves(Player.RED):
+            for move, eaten in moves.items():
+                sim  = simulate_move(board, piece, move, eaten)
+                s, _ = minimax(sim, depth-1, True, counter)
+                if s < best_s:
+                    best_s, best_m = s, (piece, move, eaten)
+        return best_s, best_m
+
+def alphabeta(board, depth, alpha, beta, maximizing, counter, deadline=None):
+    if deadline and time.time() > deadline:
+        return board.evaluate(), None
+    w = board.winner()
+    if w == Player.WHITE: return  1000.0, None
+    if w == Player.RED:   return -1000.0, None
+    if depth == 0:
+        counter[0] += 1
+        return board.evaluate(), None
+    counter[0] += 1
+    if maximizing:
+        best_s, best_m = float('-inf'), None
+        for piece, moves in board.get_all_valid_moves(Player.WHITE):
+            for move, eaten in moves.items():
+                sim  = simulate_move(board, piece, move, eaten)
+                s, _ = alphabeta(sim, depth-1, alpha, beta, False, counter, deadline)
+                if s > best_s:
+                    best_s, best_m = s, (piece, move, eaten)
+                alpha = max(alpha, s)
+                if beta <= alpha: break
+        return best_s, best_m
+    else:
+        best_s, best_m = float('inf'), None
+        for piece, moves in board.get_all_valid_moves(Player.RED):
+            for move, eaten in moves.items():
+                sim  = simulate_move(board, piece, move, eaten)
+                s, _ = alphabeta(sim, depth-1, alpha, beta, True, counter, deadline)
+                if s < best_s:
+                    best_s, best_m = s, (piece, move, eaten)
+                beta = min(beta, s)
+                if beta <= alpha: break
+        return best_s, best_m
+
+class AIController:
+    TIME_LIMIT = 3.0
+
+    def __init__(self, difficulty):
+        self.difficulty = difficulty
+        self.nodes      = 0
+        self.time_ms    = 0.0
+
+    def choose_move(self, board):
+        counter  = [0]
+        t0       = time.time()
+        deadline = t0 + self.TIME_LIMIT
+
+        if self.difficulty == Difficulty.EASY:
+            result = greedy_move(board)
+            counter[0] = sum(len(m) for _,m in board.get_all_valid_moves(Player.WHITE))
+        elif self.difficulty == Difficulty.MEDIUM:
+            _, result = minimax(board, self.difficulty.depth, True, counter)
+        else:
+            _, result = alphabeta(board, self.difficulty.depth,
+                                  float('-inf'), float('inf'),
+                                  True, counter, deadline)
+
+        self.nodes   = counter[0]
+        self.time_ms = (time.time() - t0) * 1000
+        return result
+
+    def get_hint(self, board):
+        """Ambil saran langkah terbaik untuk pemain."""
+        counter = [0]
+        t0 = time.time()
+        # Balik logika: cari langkah terbaik untuk RED
+        best_score = float('-inf')
+        best = None
+        cands = board.get_all_valid_moves(Player.RED)
+        random.shuffle(cands)
+        for piece, moves in cands:
+            for move, eaten in moves.items():
+                sim = simulate_move(board, piece, move, eaten)
+                s = -sim.evaluate()  # negatif karena kita adalah RED
+                if s > best_score:
+                    best_score = s
+                    best = (piece, move, eaten)
+        return best
+
+# ──────────────────────────────────────────────────────────────
+#  GAME STATE SNAPSHOT (untuk Undo)
+# ──────────────────────────────────────────────────────────────
+class GameSnapshot:
+    def __init__(self, board, turn, move_count, last_move):
+        self.board      = board.clone()
+        self.turn       = turn
+        self.move_count = move_count
+        self.last_move  = list(last_move)
+
+# ──────────────────────────────────────────────────────────────
+#  GAME
+# ──────────────────────────────────────────────────────────────
+class Game:
+    BLINK_MS    = 400
+    MAX_HISTORY = 20  # maks undo
+
+    def __init__(self, difficulty, sfx):
+        self.board        = Board()
+        self.turn         = Player.RED
+        self.selected     = None
+        self.valid_moves  = {}
+        self.ai           = AIController(difficulty)
+        self.difficulty   = difficulty
+        self.sfx          = sfx
+        self.winner_cache = None
+        self.move_count   = 0
+        self.last_move    = []
+        self.anim         = None
+        self.blink_timer  = 0
+        self.blink_on     = True
+        self._must_eat    = []
+        self.particles    = ParticleSystem()
+        self.history      = []   # untuk undo
+        self.paused       = False
+        self.start_time   = time.time()
+        self.elapsed_pause= 0.0
+        self.pause_start  = 0.0
+
+        self.ai_pending        = False
+        self.ai_delay_timer    = 0.0
+        self.ai_thinking       = False
+        self.ai_result         = None
+
+        # Tombol navigasi ingame
+        self._nav_rects = {}
+
+    def _save_snapshot(self):
+        snap = GameSnapshot(self.board, self.turn, self.move_count, self.last_move)
+        self.history.append(snap)
+        if len(self.history) > self.MAX_HISTORY:
+            self.history.pop(0)
+
+    def undo(self):
+        """Undo 1 langkah saja — mundur ke snapshot terakhir (bisa pemain atau AI)."""
+        if not self.history:
+            return False
+        snap = self.history.pop()
+        self.board        = snap.board
+        self.turn         = snap.turn
+        self.move_count   = snap.move_count
+        self.last_move    = snap.last_move
+        self.selected     = None
+        self.valid_moves  = {}
+        self.winner_cache = None
+        self.anim         = None
+        self.ai_pending   = False
+        self._refresh_must_eat()
+        self.sfx.play("undo")
+        return True
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        if self.paused:
+            self.pause_start = time.time()
+        else:
+            self.elapsed_pause += time.time() - self.pause_start
+
+    def get_elapsed(self):
+        if self.paused:
+            return time.time() - self.start_time - self.elapsed_pause - (time.time() - self.pause_start)
+        return time.time() - self.start_time - self.elapsed_pause
+
+    def _refresh_must_eat(self):
+        self._must_eat = self.board.must_eat_pieces(Player.RED)
+
+    def handle_click(self, row, col):
+        if self.turn != Player.RED or self.anim or self.ai_pending or self.paused:
+            return
+        piece = self.board.get(row, col)
+
+        if self.selected:
+            if (row, col) in self.valid_moves:
+                self._execute_player_move(self.selected, row, col)
+                return
+            else:
+                self.selected    = None
+                self.valid_moves = {}
+
+        if piece and piece.color == Player.RED:
+            all_vm = self.board.get_all_valid_moves(Player.RED)
+            for p, m in all_vm:
+                if p is piece:
+                    self.selected    = piece
+                    self.valid_moves = m
+                    self.sfx.play("select")
+                    return
+            self.sfx.play("invalid")
+
+    def _execute_player_move(self, piece, row, col):
+        self._save_snapshot()
+        eaten = self.valid_moves[(row, col)]
+        src   = (piece.row, piece.col)
+
+        piece._px, piece._py = Piece._center(src[0], src[1])
+
+        if len(eaten) > 1:
+            # ── Multi-makan: animasi sequential ──────────────
+            # Bangun waypoints: src -> setiap landing setelah makan
+            # eaten sudah berurutan (list of piece objects dimakan)
+            waypoints = [src]
+            eaten_per_hop = []
+
+            # Rekonstruksi waypoints dari eaten & tujuan akhir
+            # eaten list berisi bidak-bidak yang dimakan, urutan sama dengan jalur
+            # Kita perlu tahu posisi landing setelah setiap makan
+            cur_row, cur_col = src
+            for ep in eaten:
+                er, ec = ep.row, ep.col
+                dr = 1 if er > cur_row else -1
+                dc = 1 if ec > cur_col else -1
+                # Landing = 1 kotak setelah lawan
+                lr, lc = er + dr, ec + dc
+                waypoints.append((lr, lc))
+                eaten_per_hop.append([ep])
+                cur_row, cur_col = lr, lc
+
+            # Pastikan waypoint terakhir adalah tujuan sebenarnya
+            if waypoints[-1] != (row, col):
+                waypoints[-1] = (row, col)
+
+            # Pindahkan piece di board sekarang (tanpa hapus eaten — anim yg akan hapus)
+            self.board.grid[piece.row][piece.col] = None
+            piece.row, piece.col = row, col
+            self.board.grid[row][col] = piece
+
+            became_king = False
+            if not piece.king:
+                if row == 0 and piece.color == Player.RED:
+                    piece.make_king(); self.board.red_kings += 1; became_king = True
+                elif row == ROWS-1 and piece.color == Player.WHITE:
+                    piece.make_king(); self.board.white_kings += 1; became_king = True
+
+            self.last_move = [src, (row, col)]
+            self.move_count += 1
+
+            self.anim = MultiMoveAnim(piece, waypoints, eaten_per_hop,
+                                      self.particles, self.sfx, self.board)
+
+            if became_king:
+                self.sfx.play("king")
+                kx, ky = Piece._center(row, col)
+                self.particles.burst(kx, ky, (255, 215, 40), 28)
+
+        else:
+            # ── Single langkah (0 atau 1 makan) ──────────────
+            for e in eaten:
+                ep = self.board.get(e.row, e.col)
+                if ep:
+                    px_, py_ = Piece._center(e.row, e.col)
+                    self.particles.burst(px_, py_,
+                                         (255, 80, 80) if ep.color == Player.RED else (200, 220, 255),
+                                         18)
+                    self.board.remove_piece(ep)
+
+            became_king = self.board.move_piece(piece, row, col)
+            self.last_move = [src, (row, col)]
+            self.move_count += 1
+
+            if eaten:       self.sfx.play("eat")
+            elif became_king:
+                self.sfx.play("king")
+                kx, ky = Piece._center(row, col)
+                self.particles.burst(kx, ky, (255, 215, 40), 24)
+            else:           self.sfx.play("move")
+
+            self.anim = MoveAnim(piece, src[0], src[1], row, col)
+
+        self.selected    = None
+        self.valid_moves = {}
+        self.turn        = Player.WHITE
+        self.winner_cache= self.board.winner()
+        self._refresh_must_eat()
+
+        self.ai_pending     = True
+        self.ai_delay_timer = random.uniform(AI_DELAY_MIN, AI_DELAY_MAX)
+        self.ai_result      = None
+
+    def trigger_ai(self):
+        result = self.ai.choose_move(self.board)
+        self.ai_result  = result
+        self.ai_pending = False
+
+        if result:
+            piece, move, eaten = result
+            p = self.board.get(piece.row, piece.col)
+            if p:
+                self._save_snapshot()
+                src = (p.row, p.col)
+                p._px, p._py = Piece._center(src[0], src[1])
+
+                if len(eaten) > 1:
+                    # Multi-makan AI: sequential anim
+                    waypoints = [src]
+                    eaten_per_hop = []
+                    cur_row, cur_col = src
+                    for ep in eaten:
+                        er, ec = ep.row, ep.col
+                        dr = 1 if er > cur_row else -1
+                        dc = 1 if ec > cur_col else -1
+                        lr, lc = er + dr, ec + dc
+                        waypoints.append((lr, lc))
+                        eaten_per_hop.append([ep])
+                        cur_row, cur_col = lr, lc
+                    if waypoints[-1] != move:
+                        waypoints[-1] = move
+
+                    self.board.grid[p.row][p.col] = None
+                    p.row, p.col = move[0], move[1]
+                    self.board.grid[move[0]][move[1]] = p
+
+                    became_king = False
+                    if not p.king:
+                        if move[0] == ROWS-1 and p.color == Player.WHITE:
+                            p.make_king(); self.board.white_kings += 1; became_king = True
+
+                    self.last_move = [src, move]
+                    self.move_count += 1
+
+                    self.anim = MultiMoveAnim(p, waypoints, eaten_per_hop,
+                                              self.particles, self.sfx, self.board)
+
+                    if became_king:
+                        self.sfx.play("king")
+                        kx, ky = Piece._center(*move)
+                        self.particles.burst(kx, ky, (255, 215, 40), 24)
+                else:
+                    for e in eaten:
+                        ep = self.board.get(e.row, e.col)
+                        if ep:
+                            px_, py_ = Piece._center(e.row, e.col)
+                            self.particles.burst(px_, py_,
+                                                 (255, 80, 80) if ep.color == Player.RED else (200, 220, 255),
+                                                 16)
+                            self.board.remove_piece(ep)
+
+                    became_king = self.board.move_piece(p, *move)
+                    self.last_move = [src, move]
+                    self.move_count += 1
+
+                    if eaten:       self.sfx.play("eat")
+                    elif became_king:
+                        self.sfx.play("king")
+                        kx, ky = Piece._center(*move)
+                        self.particles.burst(kx, ky, (255, 215, 40), 24)
+                    else:           self.sfx.play("move")
+
+                    self.anim = MoveAnim(p, src[0], src[1], *move)
+
+        self.turn         = Player.RED
+        self.selected     = None
+        self.valid_moves  = {}
+        self.winner_cache = self.board.winner()
+        self._refresh_must_eat()
+
+    def update(self, dt_ms):
+        if self.paused:
+            return
+
+        dt = dt_ms / 1000.0
+
+        if self.anim:
+            self.anim.update(dt)
+            if self.anim.done:
+                if isinstance(self.anim, MultiMoveAnim):
+                    # Snap piece ke posisi final
+                    final = self.anim.waypoints[-1]
+                    self.anim.piece.row, self.anim.piece.col = final
+                    self.anim.piece._px, self.anim.piece._py = Piece._center(*final)
+                else:
+                    self.anim.piece.snap()
+                self.anim = None
+
+        self.particles.update(dt)
+
+        self.blink_timer += dt_ms
+        if self.blink_timer >= self.BLINK_MS:
+            self.blink_timer = 0
+            self.blink_on    = not self.blink_on
+
+        if self.ai_pending and self.turn == Player.WHITE and not self.anim:
+            self.ai_delay_timer -= dt
+            if self.ai_delay_timer <= 0:
+                self.ai_thinking = True
+
+    def draw(self, win, font_sm, font_md):
+        me = self._must_eat if self.turn == Player.RED and not self.selected else []
+        self.board.draw(win, self.selected, self.valid_moves,
+                        must_eat=me, last_move=self.last_move,
+                        blink_on=self.blink_on, anim=self.anim)
+        self.particles.draw(win)
+        self._draw_panel(win, font_sm, font_md)
+
+        if self.ai_pending and not self.ai_thinking:
+            t     = time.time()
+            dot_n = int(t * 2) % 4
+            dots  = "." * dot_n
+            ov = pygame.Surface((260, 38), pygame.SRCALPHA)
+            ov.fill((0, 0, 0, 160))
+            win.blit(ov, (WIDTH//2 - 130, BOARD_SIZE//2 - 19))
+            msg = font_md.render(f"Sabar Kanda ....{dots}", True, (255, 210, 60))
+            win.blit(msg, msg.get_rect(center=(WIDTH//2, BOARD_SIZE//2)))
+
+        if self.paused:
+            self._draw_pause_overlay(win, font_md, font_sm)
+
+    def _draw_panel(self, win, font_sm, font_md):
+        py = BOARD_SIZE
+        # Panel background dengan gradient
+        panel_surf = pygame.Surface((WIDTH, PANEL_H), pygame.SRCALPHA)
+        for i in range(PANEL_H):
+            t = i / PANEL_H
+            r = int(8  + 4  * t)
+            g = int(12 + 6  * t)
+            b = int(22 + 10 * t)
+            pygame.draw.line(panel_surf, (r, g, b, 255), (0, i), (WIDTH, i))
+        win.blit(panel_surf, (0, py))
+
+        # Garis atas panel — lebih terang & tebal
+        pygame.draw.line(win, C_BORDER, (0, py), (WIDTH, py), 2)
+        # Garis tipis aksen
+        pygame.draw.line(win, (40, 80, 140), (0, py+2), (WIDTH, py+2), 1)
+
+        # ── Baris atas: info statistik ─────────────────────
+        elapsed  = self.get_elapsed()
+        mins     = int(elapsed) // 60
+        secs     = int(elapsed) % 60
+        time_str = f"{mins:02d}:{secs:02d}"
+
+        turn_col  = C_RED if self.turn == Player.RED else C_WHT_DK
+
+        INFO_Y    = py + 8
+        INFO_H    = 45
+        cw        = WIDTH // 5
+
+        # Indikator giliran (dot animasi)
+        dot_pulse = 0.5 + 0.5 * math.sin(time.time() * 4)
+        dot_r_anim = int(5 + 2 * dot_pulse)
+
+        blocks = [
+            ("MERAH",  f"{self.board.red_left} Bidak {self.board.red_kings}", C_RED),
+            ("PUTIH",  f"{self.board.white_left} Bidak {self.board.white_kings} Raja", C_WHT_DK),
+            ("GILIRAN",   "KITA KANDA" if self.turn == Player.RED else "BOT LAGI", turn_col),
+            ("LANGKAH",   f"#{self.move_count}", C_KING_GOLD),
+            ("WAKTU",  time_str, C_ACCENT),
+        ]
+        try:
+            f_label = pygame.font.SysFont("Verdana", 10)
+        except:
+            f_label = pygame.font.SysFont("Arial", 10)
+
+        for i, (title, val, col) in enumerate(blocks):
+            bx = i * cw
+            # Highlight blok giliran aktif
+            if i == 2:
+                hi = pygame.Surface((cw, INFO_H), pygame.SRCALPHA)
+                hi.fill((*turn_col[:3], 22))
+                win.blit(hi, (bx, INFO_Y))
+                # Dot animasi giliran
+                pygame.draw.circle(win, turn_col,
+                    (bx + cw - 16, INFO_Y + INFO_H//2), dot_r_anim)
+                pygame.draw.circle(win, (255,255,255,80),
+                    (bx + cw - 16, INFO_Y + INFO_H//2), dot_r_anim, 1)
+            # Label kecil abu
+            lbl_t = f_label.render(title, True, (65, 95, 145))
+            win.blit(lbl_t, (bx + 8, INFO_Y + 2))
+            # Nilai
+            lbl_v = font_sm.render(val, True, col)
+            win.blit(lbl_v, (bx + 8, INFO_Y + 18))
+            # Garis pemisah vertikal
+            if i > 0:
+                for dy in range(6, INFO_H-6):
+                    a = int(80 * math.sin(math.pi * dy / INFO_H))
+                    pygame.draw.line(win, (30, 55, 100), (bx, INFO_Y+dy), (bx, INFO_Y+dy))
+
+        # ── Garis pemisah horizontal tengah ────────────────
+        sep_y = py + 57
+        pygame.draw.line(win, (25, 42, 78), (8, sep_y), (WIDTH-8, sep_y), 1)
+
+        # ── Baris bawah: 3 tombol navigasi ─────────────────
+        BTN_Y   = sep_y + 7
+        BTN_H   = 38
+        BTN_GAP = 12
+        BTN_PAD = 14
+
+        total_gap = BTN_GAP * 2
+        avail_w   = WIDTH - BTN_PAD * 2 - total_gap
+        BW = avail_w // 3
+
+        p_rect = pygame.Rect(BTN_PAD + 0*(BW+BTN_GAP), BTN_Y, BW, BTN_H)
+        u_rect = pygame.Rect(BTN_PAD + 1*(BW+BTN_GAP), BTN_Y, BW, BTN_H)
+        m_rect = pygame.Rect(BTN_PAD + 2*(BW+BTN_GAP), BTN_Y, BW, BTN_H)
+
+        mx, my = pygame.mouse.get_pos()
+
+        # Pause / Resume
+        pause_lbl = "Lanjut" if self.paused else "Jeda"
+        pause_col = (45, 160, 65) if self.paused else (C_BTN_HOV if p_rect.collidepoint(mx,my) else C_BTN)
+        _draw_nav_btn(win, font_sm, pause_lbl, p_rect, pause_col, active=self.paused)
+
+        # Undo
+        can_undo = len(self.history) > 0 and not self.ai_pending and not self.anim
+        undo_bg  = (C_BTN_HOV if u_rect.collidepoint(mx,my) else (38,70,130)) if can_undo else (20,28,48)
+        undo_fg  = C_TEXT if can_undo else (50,65,90)
+        _draw_nav_btn(win, font_sm, "Undo", u_rect, undo_bg, fg=undo_fg, dim=not can_undo)
+
+        # Menu
+        menu_bg = (C_BTN_WARN if m_rect.collidepoint(mx,my) else (100,32,32))
+        _draw_nav_btn(win, font_sm, "Menu", m_rect, menu_bg)
+
+        self._nav_rects = {
+            'pause': p_rect,
+            'undo':  u_rect,
+            'menu':  m_rect,
+        }
+
+    def _draw_pause_overlay(self, win, font_md, font_sm):
+        ov = pygame.Surface((WIDTH, BOARD_SIZE), pygame.SRCALPHA)
+        ov.fill((4, 7, 16, 215))
+        win.blit(ov, (0, 0))
+
+        # Panel tengah dengan rounded corners
+        pw, ph = 400, 210
+        px_ = WIDTH//2 - pw//2
+        py_ = BOARD_SIZE//2 - ph//2
+
+        # Shadow panel
+        sh_p = pygame.Surface((pw+12, ph+12), pygame.SRCALPHA)
+        pygame.draw.rect(sh_p, (0,0,0,100), (6,6,pw,ph), border_radius=20)
+        win.blit(sh_p, (px_-3, py_-3))
+
+        panel = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        # Gradient panel
+        for pi in range(ph):
+            tp = pi / ph
+            pr = int(12 + 5 * tp)
+            pg_ = int(20 + 8 * tp)
+            pb = int(44 + 12 * tp)
+            pygame.draw.line(panel, (pr, pg_, pb, 245), (0, pi), (pw, pi))
+        pygame.draw.rect(panel, (*C_BORDER, 180), (0,0,pw,ph), 2, border_radius=18)
+        # Aksen garis atas
+        pygame.draw.line(panel, (*C_GOLD, 160), (20, 2), (pw-20, 2), 2)
+        win.blit(panel, (px_, py_))
+
+        lbl = font_md.render("GAME DIJEDA", True, C_GOLD)
+        win.blit(lbl, lbl.get_rect(center=(WIDTH//2, BOARD_SIZE//2 - 58)))
+
+        # Garis pemisah
+        pygame.draw.line(win, (40, 70, 130), (px_+20, BOARD_SIZE//2 - 36),
+                         (px_+pw-20, BOARD_SIZE//2 - 36), 1)
+
+        elapsed = self.get_elapsed()
+        mins = int(elapsed)//60; secs = int(elapsed)%60
+        info_txt = [
+            (f"Langkah ke-{self.move_count}", C_TEXT),
+            (f"Waktu: {mins:02d}:{secs:02d}", C_ACCENT),
+            (f"Kesulitan: {self.difficulty.label}", C_KING_GOLD),
+        ]
+        for i, (txt, col) in enumerate(info_txt):
+            lbl2 = font_sm.render(txt, True, col)
+            win.blit(lbl2, lbl2.get_rect(center=(WIDTH//2, BOARD_SIZE//2 - 8 + i*26)))
+
+        resume = font_sm.render("Tekan  P  untuk melanjutkan", True, (90, 135, 195))
+        win.blit(resume, resume.get_rect(center=(WIDTH//2, BOARD_SIZE//2 + 76)))
+
+    def handle_nav_click(self, pos):
+        """Kembalikan aksi navigasi: None, 'menu', 'undo', 'pause'"""
+        rects = self._nav_rects
+        if rects.get('pause') and rects['pause'].collidepoint(pos):
+            self.toggle_pause()
+            return 'pause'
+        if rects.get('undo') and rects['undo'].collidepoint(pos):
+            if len(self.history) > 0 and not self.ai_pending and not self.anim:
+                self.undo()
+            return 'undo'
+        if rects.get('menu') and rects['menu'].collidepoint(pos):
+            return 'menu'
+        return None
+
+    def get_restart_rect(self):
+        return None  # tidak dipakai lagi, sudah ada di nav
+
+# ──────────────────────────────────────────────────────────────
+#  UI HELPERS
+# ──────────────────────────────────────────────────────────────
+def draw_button(win, font, text, rect, bg, fg=(255,255,255), r=10):
+    sh = pygame.Surface((rect.w+4, rect.h+4), pygame.SRCALPHA)
+    pygame.draw.rect(sh, (0,0,0,80), (2,2, rect.w, rect.h), border_radius=r)
+    win.blit(sh, (rect.x-1, rect.y-1))
+    pygame.draw.rect(win, bg, rect, border_radius=r)
+    pygame.draw.rect(win, C_BORDER, rect, 2, border_radius=r)
+
+def _draw_nav_btn(win, font, text, rect, bg, fg=(230,238,255), r=8, active=False, dim=False):
+    """Tombol navigasi panel bawah — ramping, modern."""
+    sh = pygame.Surface((rect.w+4, rect.h+4), pygame.SRCALPHA)
+    pygame.draw.rect(sh, (0,0,0,60), (2,2, rect.w, rect.h), border_radius=r)
+    win.blit(sh, (rect.x-1, rect.y-1))
+    pygame.draw.rect(win, bg, rect, border_radius=r)
+    if active:
+        border_c = (120, 255, 140)
+    elif dim:
+        border_c = (35, 50, 80)
+    else:
+        border_c = (60, 100, 170)
+    pygame.draw.rect(win, border_c, rect, 1, border_radius=r)
+    lbl = font.render(text, True, fg)
+    win.blit(lbl, lbl.get_rect(center=rect.center))
+
+def center_text(win, font, text, y, color=C_TEXT):
+    lbl = font.render(text, True, color)
+    win.blit(lbl, lbl.get_rect(center=(WIDTH//2, y)))
+
+# ──────────────────────────────────────────────────────────────
+#  MENU SCREEN — Modern & Minimalis
+# ──────────────────────────────────────────────────────────────
+def draw_hex_grid(win, t, alpha=18):
+    """Latar hexagon animasi ringan."""
+    size = 38
+    w3   = size * math.sqrt(3)
+    h3   = size * 1.5
+    surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    for col_ in range(-1, int(WIDTH/w3)+2):
+        for row_ in range(-1, int(HEIGHT/h3)+2):
+            cx_ = col_ * w3 + (w3/2 if row_%2 else 0) + math.sin(t*0.3)*4
+            cy_ = row_ * h3
+            pts = [(cx_ + size*math.cos(math.radians(60*i+30)),
+                    cy_ + size*math.sin(math.radians(60*i+30))) for i in range(6)]
+            pygame.draw.polygon(surf, (255,255,255,alpha), pts, 1)
+    win.blit(surf, (0,0))
+
+def menu_screen(win, clock, F_TITLE, F_MD, F_SM, F_XL):
+    diffs = list(Difficulty)
+    sel   = Difficulty.MEDIUM
+    sfx_on= True
+    t0    = time.time()
+
+    # Layout kartu difficulty
+    card_w, card_h = 196, 120
+    card_gap = 20
+    total_w  = 3*card_w + 2*card_gap
+    cards_x  = WIDTH//2 - total_w//2
+    cards_y  = 310
+
+    cards = {}
+    for i, d in enumerate(diffs):
+        cards[d] = pygame.Rect(cards_x + i*(card_w+card_gap), cards_y, card_w, card_h)
+
+    start_rect = pygame.Rect(WIDTH//2 - 150, 480, 300, 54)
+    sfx_rect   = pygame.Rect(WIDTH - 130, 16, 116, 34)
+
+    icons = {
+        Difficulty.EASY:   ("E", "Greedy",     "Cocok untuk pemula"),
+        Difficulty.MEDIUM: ("M", "Minimax",     "Tantangan seimbang"),
+        Difficulty.HARD:   ("H", "Alpha-Beta",  "Untuk yang ahli!"),
+    }
+
+    # Warna per difficulty
+    diff_colors = {
+        Difficulty.EASY:   (60, 170, 80),
+        Difficulty.MEDIUM: (255, 165, 0),
+        Difficulty.HARD:   (200, 70, 50),
+    }
+
+    while True:
+        win.fill(C_BG)
+        t = time.time() - t0
+
+        # Background hex grid
+        draw_hex_grid(win, t, alpha=12)
+
+        # Gradient overlay
+        grad = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        for gy in range(HEIGHT):
+            a = int(100 * (1 - gy/HEIGHT) ** 1.5)
+            pygame.draw.line(grad, (10,16,28, a), (0, gy), (WIDTH, gy))
+        win.blit(grad, (0,0))
+
+        mx, my = pygame.mouse.get_pos()
+
+        # ── Logo / Badge atas ──────────────────────────────
+        # Lingkaran glow
+        glow_a = int(28 + 10*math.sin(t*1.2))
+        gs = pygame.Surface((500, 110), pygame.SRCALPHA)
+        pygame.draw.ellipse(gs, (255,200,40, glow_a), (0,0,500,110))
+        win.blit(gs, (WIDTH//2-250, 74))
+
+        yo = int(math.sin(t*0.85) * 3)
+
+        # Shadow judul
+        lbl_sh = F_XL.render("DAM KAN MI", True, (0,0,0))
+        win.blit(lbl_sh, lbl_sh.get_rect(center=(WIDTH//2+3, 120+yo+3)))
+        lbl_title = F_XL.render("DAM KAN MI", True, C_GOLD)
+        win.blit(lbl_title, lbl_title.get_rect(center=(WIDTH//2, 120+yo)))
+
+        lbl_sub = F_MD.render("CATUR TAPI BEDA", True, (140, 190, 240))
+        win.blit(lbl_sub, lbl_sub.get_rect(center=(WIDTH//2, 168)))
+
+        # Garis dekoratif
+        pygame.draw.line(win, (*C_GOLD, 120), (WIDTH//2-180, 192), (WIDTH//2+180, 192), 1)
+        pygame.draw.circle(win, C_GOLD, (WIDTH//2, 192), 3)
+
+        # ── Subtitle pilih kesulitan ─────────────────────
+        lbl_choose = F_SM.render("— PILIH TINGKAT KESULITAN —", True, (100, 145, 200))
+        win.blit(lbl_choose, lbl_choose.get_rect(center=(WIDTH//2, 272)))
+
+        # ── Kartu Difficulty ──
+        for d, rect in cards.items():
+            icon, algo, desc = icons[d]
+            is_sel  = (d == sel)
+            hovered = rect.collidepoint(mx, my)
+            dc      = diff_colors[d]
+
+            # Shadow
+            sh_s = pygame.Surface((card_w+8, card_h+8), pygame.SRCALPHA)
+            pygame.draw.rect(sh_s, (0,0,0,90), (4,4,card_w,card_h), border_radius=16)
+            win.blit(sh_s, (rect.x-2, rect.y-2))
+
+            # Background kartu
+            if is_sel:
+                # Gradient biru
+                card_surf = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
+                for cy_ in range(card_h):
+                    t_c = cy_ / card_h
+                    r_ = int(30 + 15 * t_c)
+                    g_ = int(65 + 20 * t_c)
+                    b_ = int(155 + 25 * t_c)
+                    pygame.draw.line(card_surf, (r_, g_, b_, 255), (0, cy_), (card_w, cy_))
+                win.blit(card_surf, rect.topleft)
+                border_col = dc
+                bw = 2
+            elif hovered:
+                pygame.draw.rect(win, (25, 50, 105), rect, border_radius=16)
+                border_col = (90, 140, 220)
+                bw = 2
+            else:
+                pygame.draw.rect(win, (14, 24, 52), rect, border_radius=16)
+                border_col = (38, 62, 115)
+                bw = 1
+
+            # Glow jika terpilih
+            if is_sel:
+                pulse = int(4 + 2*math.sin(t*3))
+                glow_s = pygame.Surface((card_w+pulse*2+4, card_h+pulse*2+4), pygame.SRCALPHA)
+                pygame.draw.rect(glow_s, (*dc, 30), (0,0,card_w+pulse*2+4,card_h+pulse*2+4), border_radius=18)
+                win.blit(glow_s, (rect.x-pulse-2, rect.y-pulse-2))
+
+            # Accent bar atas kartu (warna per difficulty)
+            if is_sel:
+                bar_rect = pygame.Rect(rect.x+2, rect.y+2, card_w-4, 4)
+                pygame.draw.rect(win, dc, bar_rect, border_radius=4)
+
+            pygame.draw.rect(win, border_col, rect, bw, border_radius=16)
+
+            # Ikon
+            ico_col = dc if is_sel else (C_TEXT if hovered else (130,165,210))
+            ico_lbl = F_MD.render(icon, True, ico_col)
+            win.blit(ico_lbl, ico_lbl.get_rect(center=(rect.centerx, rect.y+32)))
+
+            # Nama level
+            nm_lbl = F_MD.render(d.label, True, (255,255,255) if is_sel else (200,215,240))
+            win.blit(nm_lbl, nm_lbl.get_rect(center=(rect.centerx, rect.y+62)))
+
+            # Algoritma
+            alg_lbl = F_SM.render(algo, True, dc if is_sel else (80,115,170))
+            win.blit(alg_lbl, alg_lbl.get_rect(center=(rect.centerx, rect.y+84)))
+
+            # Deskripsi
+            desc_lbl = F_SM.render(desc, True, (160,210,255) if is_sel else (65,95,145))
+            win.blit(desc_lbl, desc_lbl.get_rect(center=(rect.centerx, rect.y+104)))
+
+        # ── Tombol Mulai ──
+        hover_s   = start_rect.collidepoint(mx, my)
+        # Shadow tombol
+        sh_btn = pygame.Surface((start_rect.w+8, start_rect.h+8), pygame.SRCALPHA)
+        pygame.draw.rect(sh_btn, (0, 150, 60, 60), (4,4,start_rect.w,start_rect.h), border_radius=16)
+        win.blit(sh_btn, (start_rect.x-2, start_rect.y-2))
+        # Gradient tombol
+        btn_surf = pygame.Surface((start_rect.w, start_rect.h), pygame.SRCALPHA)
+        for by in range(start_rect.h):
+            t_b = by / start_rect.h
+            r_ = int(50 + 20 * t_b) if hover_s else int(38 + 10 * t_b)
+            g_ = int(175 + 15 * t_b) if hover_s else int(152 + 10 * t_b)
+            b_ = int(80 + 10 * t_b) if hover_s else int(65 + 10 * t_b)
+            pygame.draw.line(btn_surf, (r_, g_, b_, 255), (0, by), (start_rect.w, by))
+        win.blit(btn_surf, start_rect.topleft)
+        border_c = (110,255,150) if hover_s else (70,200,110)
+        pygame.draw.rect(win, border_c, start_rect, 2 if hover_s else 1, border_radius=14)
+
+        start_lbl = F_MD.render("MULAI BERMAIN", True, (255,255,255))
+        win.blit(start_lbl, start_lbl.get_rect(center=start_rect.center))
+
+        # ── Tombol SFX (pojok kanan atas) ──
+        sfx_lbl_txt = "SFX ON" if sfx_on else "SFX OFF"
+        sfx_col = (28, 72, 45) if sfx_on else (65, 28, 28)
+        sfx_hov = (40, 95, 60) if sfx_on else (90, 38, 38)
+        _bg = sfx_hov if sfx_rect.collidepoint(mx, my) else sfx_col
+        pygame.draw.rect(win, _bg, sfx_rect, border_radius=8)
+        pygame.draw.rect(win, (60,100,70) if sfx_on else (100,50,50), sfx_rect, 1, border_radius=8)
+        sfx_lbl = F_SM.render(sfx_lbl_txt, True, (200,240,200) if sfx_on else (240,180,180))
+        win.blit(sfx_lbl, sfx_lbl.get_rect(center=sfx_rect.center))
+
+        # ── Info bawah ──
+        center_text(win, F_SM, "ESC = Keluar   ·   P = Jeda   ·   Z/U = Undo", 558, (48, 72, 118))
+
+        # Versi
+        ver_lbl = F_SM.render("v6.0", True, (38, 58, 95))
+        win.blit(ver_lbl, (WIDTH-42, HEIGHT-20))
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+                if ev.key == pygame.K_RETURN or ev.key == pygame.K_SPACE:
+                    return sel, sfx_on
+            if ev.type == pygame.MOUSEBUTTONDOWN:
+                for d, r in cards.items():
+                    if r.collidepoint(ev.pos):
+                        sel = d
+                if start_rect.collidepoint(ev.pos):
+                    return sel, sfx_on
+                if sfx_rect.collidepoint(ev.pos):
+                    sfx_on = not sfx_on
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+# ──────────────────────────────────────────────────────────────
+#  GAME OVER
+# ──────────────────────────────────────────────────────────────
+def gameover_screen(win, clock, F_TITLE, F_MD, F_SM, winner, sfx):
+    if winner == Player.RED:
+        msg, col = "BOTJI MU LAWAN!", (255, 215, 60)
+        sfx.play("win")
+    else:
+        msg, col = "KALAH SAMA BOT?", (100, 215, 255)
+        sfx.play("lose")
+
+    btn_menu   = pygame.Rect(WIDTH//2 - 230, 420, 200, 58)
+    btn_replay = pygame.Rect(WIDTH//2 + 30,  420, 200, 58)
+    t0 = time.time()
+
+    while True:
+        win.fill(C_BG)
+        t = time.time() - t0
+        draw_hex_grid(win, t, alpha=12)
+        yo = int(math.sin(t * 2) * 8)
+
+        gs = pygame.Surface((WIDTH, 120), pygame.SRCALPHA)
+        gs.fill((*(col[:3]), 18))
+        win.blit(gs, (0, 175+yo))
+
+        center_text(win, F_TITLE, msg, 210 + yo, col)
+        center_text(win, F_MD, "Permainan selesai!", 290, C_TEXT)
+        center_text(win, F_SM, "Terima kasih telah bermain!", 330, C_TEXT2)
+
+        mx, my = pygame.mouse.get_pos()
+
+        hm = btn_menu.collidepoint(mx,my)
+        hr = btn_replay.collidepoint(mx,my)
+
+        pygame.draw.rect(win, (C_BTN_HOV if hm else C_BTN), btn_menu, border_radius=12)
+        pygame.draw.rect(win, C_BORDER, btn_menu, 2, border_radius=12)
+        lm = F_MD.render("Menu Utama", True, (255,255,255))
+        win.blit(lm, lm.get_rect(center=btn_menu.center))
+
+        pygame.draw.rect(win, (C_BTN_HOV if hr else C_BTN_ACT), btn_replay, border_radius=12)
+        pygame.draw.rect(win, (100,255,140) if hr else C_BORDER, btn_replay, 2, border_radius=12)
+        lr = F_MD.render("Main Lagi", True, (255,255,255))
+        win.blit(lr, lr.get_rect(center=btn_replay.center))
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE: return "menu"
+                if ev.key == pygame.K_r:      return "replay"
+            if ev.type == pygame.MOUSEBUTTONDOWN:
+                if btn_menu.collidepoint(ev.pos):   return "menu"
+                if btn_replay.collidepoint(ev.pos): return "replay"
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+# ──────────────────────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────────────────────
+def main():
+    pygame.init()
+    pygame.mixer.pre_init(44100, -16, 2, 512)
+    pygame.mixer.init()
+
+    win   = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("GAME DAM SIMPEL")
+    clock = pygame.time.Clock()
+
+    try:
+        F_XL    = pygame.font.SysFont("Verdana", 54, bold=True)
+        F_TITLE = pygame.font.SysFont("Verdana", 40, bold=True)
+        F_MD    = pygame.font.SysFont("Verdana", 20, bold=True)
+        F_SM    = pygame.font.SysFont("Verdana", 14)
+    except:
+        F_XL    = pygame.font.SysFont("Arial", 54, bold=True)
+        F_TITLE = pygame.font.SysFont("Arial", 40, bold=True)
+        F_MD    = pygame.font.SysFont("Arial", 20, bold=True)
+        F_SM    = pygame.font.SysFont("Arial", 14)
+
+    sfx        = SoundFX()
+    state      = "menu"
+    difficulty = Difficulty.MEDIUM
+    game       = None
+
+    while True:
+        dt = clock.tick(FPS)
+
+        # ── MENU ──────────────────────────────────────────────
+        if state == "menu":
+            difficulty, sfx_on = menu_screen(win, clock, F_TITLE, F_MD, F_SM, F_XL)
+            sfx.enabled = sfx_on
+            game        = Game(difficulty, sfx)
+            game._refresh_must_eat()
+            state       = "play"
+
+        # ── PLAY ──────────────────────────────────────────────
+        elif state == "play":
+            game.update(dt)
+
+            if game.ai_thinking:
+                game.ai_thinking = False
+                win.fill(C_BG)
+                game.draw(win, F_SM, F_MD)
+                ov = pygame.Surface((WIDTH, 42), pygame.SRCALPHA)
+                ov.fill((0, 0, 0, 170))
+                win.blit(ov, (0, BOARD_SIZE//2 - 21))
+                think = F_MD.render("Sabar Kandaa .... ", True, (255, 210, 60))
+                win.blit(think, think.get_rect(center=(WIDTH//2, BOARD_SIZE//2)))
+                pygame.display.flip()
+                pygame.event.pump()
+                game.trigger_ai()
+
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE:
+                        state = "menu"
+                    if ev.key == pygame.K_p:
+                        game.toggle_pause()
+                    if ev.key == pygame.K_z or ev.key == pygame.K_u:
+                        if not game.ai_pending and not game.anim:
+                            game.undo()
+                    if ev.key == pygame.K_r:
+                        game = Game(difficulty, sfx)
+                        game._refresh_must_eat()
+
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    mx_, my_ = ev.pos
+                    # Cek nav dulu
+                    nav_action = game.handle_nav_click(ev.pos)
+                    if nav_action == 'menu':
+                        state = "menu"
+                        continue
+                    if nav_action in ('pause', 'undo'):
+                        continue
+                    # Klik papan
+                    if my_ < BOARD_SIZE and not game.paused:
+                        game.handle_click(my_ // SQ, mx_ // SQ)
+
+            win.fill(C_BG)
+            game.draw(win, F_SM, F_MD)
+
+            pygame.display.flip()
+
+            if game.winner_cache and not game.anim:
+                state = "gameover"
+
+        # ── GAMEOVER ──────────────────────────────────────────
+        elif state == "gameover":
+            action = gameover_screen(win, clock, F_TITLE, F_MD, F_SM,
+                                     game.winner_cache, sfx)
+            if action == "menu":
+                state = "menu"
+            elif action == "replay":
+                game  = Game(difficulty, sfx)
+                game._refresh_must_eat()
+                state = "play"
+
+if __name__ == "__main__":
+    main()
